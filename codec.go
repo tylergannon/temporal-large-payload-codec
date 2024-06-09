@@ -5,20 +5,17 @@
 package codec
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"path"
 	"strconv"
+	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.temporal.io/api/common/v1"
 	"go.temporal.io/sdk/converter"
 )
@@ -27,21 +24,29 @@ const (
 	remoteCodecName = "temporal.io/remote-codec"
 )
 
+type EncodedPayload struct {
+	Metadata  []byte `db:"metadata"`
+	Data      []byte `db:"data"`
+	Sha256Sum []byte `db:"sha256"`
+}
+
+type DBTX interface {
+	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...interface{}) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...interface{}) pgx.Row
+	CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error)
+}
+
 type Codec struct {
-	// client is the HTTP client used for talking to the LPS server.
-	client *http.Client
-	// url is the base URL of the LPS server.
-	url *url.URL
+	setter func(ctx context.Context, db DBTX, payload EncodedPayload) (id int64, err error)
+	getter func(ctx context.Context, db DBTX, id int64) (payload EncodedPayload, err error)
+	pgpool *pgxpool.Pool
 	// version is the LPS API version (v1 or v2).
 	version string
 	// minBytes is the minimum size of the payload in order to use remote codec.
 	minBytes int
 	// namespace is the Temporal namespace the client using this codec is connected to.
 	namespace string
-}
-
-type keyResponse struct {
-	Key string `json:"key"`
 }
 
 type remotePayload struct {
@@ -63,19 +68,6 @@ type applier func(*Codec) error
 
 func (a applier) apply(c *Codec) error {
 	return a(c)
-}
-
-// WithURL sets the endpoint for the remote payload storage service.
-// This option is mandatory.
-func WithURL(u string) Option {
-	return applier(func(c *Codec) error {
-		lpsURL, err := url.Parse(u)
-		if err != nil {
-			return errors.New("invalid remote codec URL")
-		}
-		c.url = lpsURL
-		return nil
-	})
 }
 
 // WithMinBytes configures the minimum size of an event payload needed to trigger
@@ -110,12 +102,23 @@ func WithMinBytes(bytes uint32) Option {
 	})
 }
 
-// WithHTTPClient sets a custom http.Client.
-//
-// If unspecified, http.DefaultClient will be used.
-func WithHTTPClient(client *http.Client) Option {
+func WithPool(pool *pgxpool.Pool) Option {
 	return applier(func(c *Codec) error {
-		c.client = client
+		c.pgpool = pool
+		return nil
+	})
+}
+
+func WithGetter(g func(ctx context.Context, db DBTX, id int64) (payload EncodedPayload, err error)) Option {
+	return applier(func(c *Codec) error {
+		c.getter = g
+		return nil
+	})
+}
+
+func WithSetter(s func(ctx context.Context, db DBTX, payload EncodedPayload) (id int64, err error)) Option {
+	return applier(func(c *Codec) error {
+		c.setter = s
 		return nil
 	})
 }
@@ -137,26 +140,12 @@ func WithVersion(version string) Option {
 	})
 }
 
-// WithHTTPRoundTripper sets custom Transport on the http.Client.
-//
-// This may be used to implement use cases including authentication or tracing.
-func WithHTTPRoundTripper(rt http.RoundTripper) Option {
-	return applier(func(c *Codec) error {
-		if c.client == nil {
-			return fmt.Errorf("no http client option set")
-		}
-		c.client.Transport = rt
-		return nil
-	})
-}
-
 // New instantiates a Codec. WithURL is a required option.
 //
 // An error may be returned if incompatible options are configured or if a
 // connection to the remote payload storage service cannot be established.
 func New(opts ...Option) (*Codec, error) {
 	c := Codec{
-		client: http.DefaultClient,
 		// 128KB happens to be the lower bound for blobs eligible for AWS S3
 		// Intelligent-Tiering:
 		// https://aws.amazon.com/s3/storage-classes/intelligent-tiering/
@@ -173,30 +162,19 @@ func New(opts ...Option) (*Codec, error) {
 		return nil, fmt.Errorf("a namespace is required")
 	}
 
-	// Check for required attributes
-	if c.client == nil {
-		return nil, fmt.Errorf("an http client is required")
-	}
-	if c.url == nil {
-		return nil, fmt.Errorf("a remote codec URL is required")
-	}
-
 	if c.version == "" {
-		c.version = "v2"
+		c.version = "v1"
 	}
 
-	if c.version != "v2" {
+	if c.version != "v1" {
 		return nil, fmt.Errorf("invalid codec version: %s", c.version)
 	}
 
 	// Check connectivity
-	headURL := c.url.JoinPath(c.version, "health", "head")
-	resp, err := c.client.Head(headURL.String())
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("got status code %d from storage service at %s", resp.StatusCode, headURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := c.pgpool.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("failed connecting to pgpool: %w", err)
 	}
 
 	return &c, nil
@@ -207,9 +185,10 @@ func (c *Codec) Encode(payloads []*common.Payload) ([]*common.Payload, error) {
 		ctx    = context.Background()
 		result = make([]*common.Payload, len(payloads))
 	)
-
 	for i, payload := range payloads {
-		if payload.Size() > c.minBytes {
+		norgle := c.minBytes
+		poop := payload.Size()
+		if poop > norgle {
 			encodePayload, err := c.encodePayload(ctx, payload)
 			if err != nil {
 				return nil, err
@@ -223,60 +202,36 @@ func (c *Codec) Encode(payloads []*common.Payload) ([]*common.Payload, error) {
 	return result, nil
 }
 
-func (c *Codec) encodePayload(ctx context.Context, payload *common.Payload) (*common.Payload, error) {
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPut,
-		c.url.JoinPath(c.version).String(),
-		bytes.NewReader(payload.GetData()),
-	)
-	if err != nil {
-		return nil, err
-	}
-	req.URL.Path = path.Join(req.URL.Path, "blobs/put")
+func stringDigest(byteDigest []byte) string {
+	return "sha256:" + hex.EncodeToString(byteDigest)
+}
 
+func (c *Codec) encodePayload(ctx context.Context, payload *common.Payload) (*common.Payload, error) {
+	data := payload.GetData()
 	sha2 := sha256.New()
 	sha2.Write(payload.GetData())
-	digest := "sha256:" + hex.EncodeToString(sha2.Sum(nil))
-
-	q := req.URL.Query()
-	q.Set("digest", digest)
-	q.Set("namespace", c.namespace)
-	req.URL.RawQuery = q.Encode()
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = int64(len(payload.GetData()))
+	byteDigest := sha2.Sum(nil)
 
 	// Set metadata header
 	md, err := json.Marshal(payload.GetMetadata())
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("X-Temporal-Metadata", base64.StdEncoding.EncodeToString(md))
 
-	resp, err := c.client.Do(req)
+	id, err := c.setter(ctx, c.pgpool, EncodedPayload{
+		Metadata:  md,
+		Data:      data,
+		Sha256Sum: byteDigest,
+	})
 	if err != nil {
 		return nil, err
-	}
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("server returned status code %d: %s", resp.StatusCode, respBody)
-	}
-
-	var key keyResponse
-	if err := json.Unmarshal(respBody, &key); err != nil {
-		return nil, fmt.Errorf("unable to unmarshal put response: %w", err)
 	}
 
 	result, err := converter.GetDefaultDataConverter().ToPayload(remotePayload{
 		Metadata: payload.GetMetadata(),
 		Size:     uint(len(payload.GetData())),
-		Digest:   digest,
-		Key:      key.Key,
+		Digest:   stringDigest(byteDigest),
+		Key:      fmt.Sprint(id),
 	})
 	if err != nil {
 		return nil, err
@@ -313,58 +268,34 @@ func (c *Codec) decodePayload(ctx context.Context, payload *common.Payload, vers
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodGet,
-		c.url.JoinPath(version).String(),
-		nil,
-	)
+	// Parse remoteP.Key into an int64.
+	key, err := strconv.ParseInt(remoteP.Key, 10, 64)
 	if err != nil {
 		return nil, err
 	}
-	req.URL.Path = path.Join(req.URL.Path, "blobs/get")
-
-	q := req.URL.Query()
-	if version == "v1" {
-		q.Set("digest", remoteP.Digest)
-	}
-	if version == "v2" {
-		q.Set("key", remoteP.Key)
-	}
-	req.URL.RawQuery = q.Encode()
-
-	req.Header.Set("Content-Type", "application/octet-stream")
-	// TODO: we temporarily need this because we aren't checking object metadata on the server
-	req.Header.Set("X-Payload-Expected-Content-Length", strconv.FormatUint(uint64(remoteP.Size), 10))
-
-	resp, err := c.client.Do(req)
+	encodedPayload, err := c.getter(ctx, c.pgpool, key)
 	if err != nil {
 		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("server returned status code %d: %s", resp.StatusCode, respBody)
 	}
 
 	sha2 := sha256.New()
-	tee := io.TeeReader(resp.Body, sha2)
-	b, err := io.ReadAll(tee)
+	_, err = sha2.Write(encodedPayload.Data)
 	if err != nil {
 		return nil, err
 	}
 
-	if uint(len(b)) != remoteP.Size {
-		return nil, fmt.Errorf("wanted object of size %d, got %d", remoteP.Size, len(b))
+	if uint(len(encodedPayload.Data)) != remoteP.Size {
+		return nil, fmt.Errorf("wanted object of size %d, got %d", remoteP.Size, len(encodedPayload.Data))
 	}
 
-	checkSum := hex.EncodeToString(sha2.Sum(nil))
-	if fmt.Sprintf("sha256:%s", checkSum) != remoteP.Digest {
+	checkSum := stringDigest(sha2.Sum(nil))
+
+	if checkSum != remoteP.Digest {
 		return nil, fmt.Errorf("wanted object sha %s, got %s", remoteP.Digest, checkSum)
 	}
 
 	return &common.Payload{
 		Metadata: remoteP.Metadata,
-		Data:     b,
+		Data:     encodedPayload.Data,
 	}, nil
 }
